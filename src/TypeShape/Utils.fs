@@ -17,14 +17,16 @@ open System.Runtime.Serialization
 type private ICell =
     abstract Type : Type
     abstract IsValueCreated : bool
+    abstract Key : option<obj>
     abstract Value : obj with get,set
 
 /// Value container that will eventually be populated
-type Cell<'T> internal () =
+type Cell<'T> internal (key:option<obj>) =
     let mutable isValueCreated = false
     let mutable value = Unchecked.defaultof<'T>
     member __.Id = id
     member __.IsValueCreated : bool = isValueCreated
+    member __.Key = key
     member __.Value : 'T = 
         if isValueCreated then value else
         sprintf "Value for '%O' has not been initialized." typeof<'T>
@@ -40,16 +42,17 @@ type Cell<'T> internal () =
     interface ICell with
         member __.Type = typeof<'T>
         member __.IsValueCreated = __.IsValueCreated
+        member __.Key with get () = key
         member __.Value with get () = box __.Value
         member __.Value with set t = __.Value <- unbox t
 
 
 
 [<NoEquality; NoComparison>]
-type private GenPayload = { Cell : ICell ; DelayedValue : obj ; Dependencies : HashSet<Type> }
+type private GenPayload = { Cell : ICell ; DelayedValue : obj ; Dependencies : HashSet<option<obj>*Type> }
 
 [<NoEquality; NoComparison>]
-type private CachePayload = { Type : Type ; Value : obj ; Dependencies : HashSet<Type> }
+type private CachePayload = { Key : option<obj>; Type : Type ; Value : obj ; Dependencies : HashSet<option<obj>*Type> }
 
 type GenerationToken<'T> = internal | GenerationToken
 
@@ -61,8 +64,8 @@ type CachedResult<'T> =
 /// Helper class for generating recursive values
 type TypeGenerationContext internal (parentCache : TypeCache option) =
     let id = let g = Guid.NewGuid() in g.ToString()
-    let stack = new Stack<Type>()
-    let dict = new Dictionary<Type, GenPayload>()
+    let stack = new Stack<option<obj>*Type>()
+    let dict = new Dictionary<option<obj>*Type, GenPayload>()
 
     let mutable isDisposed = false
     let mutable isAcquired = 0
@@ -72,11 +75,11 @@ type TypeGenerationContext internal (parentCache : TypeCache option) =
             { new IDisposable with member __.Dispose() = isAcquired <- 0 }
         else invalidOp "Multi-threaded usage of TypeGenerationContext not supported."
 
-    let registerDependency (child : Type) =
+    let registerDependency (key:option<obj>) (child : Type) =
         if stack.Count > 0 then
             let parent = stack.Peek()
             let pcell = dict.[parent]
-            let _ = pcell.Dependencies.Add child
+            let _ = pcell.Dependencies.Add (key, child)
             ()
 
     new () = new TypeGenerationContext(None)
@@ -91,32 +94,64 @@ type TypeGenerationContext internal (parentCache : TypeCache option) =
     /// <param name="delay">Delay function used for defining recursive values.</param>
     member __.InitOrGetCachedValue<'T>(delay : Cell<'T> -> 'T) : CachedResult<'T> =
         use _d = acquire()
-        registerDependency typeof<'T>
+        registerDependency None typeof<'T>
         let mutable t = Unchecked.defaultof<'T>
         match parentCache with
         | Some c when c.TryGetValue(&t) -> Cached(t, true)
         | _ ->
-            let ok,found = dict.TryGetValue typeof<'T>
+            let ok,found = dict.TryGetValue ((None, typeof<'T>))
             if ok then
                 if found.Cell.IsValueCreated then 
                     Cached(found.Cell.Value :?> 'T, isValueCreated = true)
                 else 
                     Cached(found.DelayedValue :?> 'T, isValueCreated = false)
             else
-                let cell = new Cell<'T>()
+                let cell = new Cell<'T>(None)
                 let delayed = delay cell
                 let p = { Cell = cell ; DelayedValue = delayed ; Dependencies = HashSet() }
-                stack.Push typeof<'T>
-                dict.Add(typeof<'T>, p)
+                stack.Push (None, typeof<'T>)
+                dict.Add((None, typeof<'T>), p)
                 NotCached GenerationToken
+
+    member __.InitOrGetCachedValue<'Key,'T> (key:'Key, delay : Cell<'T> -> 'T) : CachedResult<'T> =
+        use _d = acquire()
+        let okey = Some (box key)
+        registerDependency okey typeof<'T>
+        let mutable t = Unchecked.defaultof<'T>
+        match parentCache with
+        | Some c when c.TryGetValue(&t) -> Cached(t, true)
+        | _ ->
+            let ok,found = dict.TryGetValue ((okey, typeof<'T>))
+            if ok then
+                if found.Cell.IsValueCreated then 
+                    Cached(found.Cell.Value :?> 'T, isValueCreated = true)
+                else 
+                    Cached(found.DelayedValue :?> 'T, isValueCreated = false)
+            else
+                let cell = new Cell<'T>(okey)
+                let delayed = delay cell
+                let p = { Cell = cell ; DelayedValue = delayed ; Dependencies = HashSet() }
+                stack.Push (okey, typeof<'T>)
+                dict.Add((okey, typeof<'T>), p)
+                NotCached GenerationToken
+
 
     /// Commits computed value to the generator.
     member __.Commit<'T> (_ : GenerationToken<'T>) (value : 'T) : 'T =
         use _d = acquire()
-        if stack.Count = 0 || stack.Pop() <> typeof<'T> then invalidOp "TypeGenerationContext: unexpected commit operation"
-        let p = dict.[typeof<'T>]
+        if stack.Count = 0 || stack.Pop() <> (None, typeof<'T>) then invalidOp "TypeGenerationContext: unexpected commit operation"
+        let p = dict.[(None, typeof<'T>)]
         p.Cell.Value <- value
         value
+
+    member __.CommitKey<'Key,'T> (_ : GenerationToken<'T>) (key:'Key) (value:'T) : 'T =
+        use _d = acquire()
+        let okey = Some (box key)
+        if stack.Count = 0 || stack.Pop() <> (okey, typeof<'T>) then invalidOp "TypeGenerationContext: unexpected commit operation"
+        let p = dict.[(okey, typeof<'T>)]
+        p.Cell.Value <- value
+        value
+
 
     member internal __.GetGeneratedValues() =
         use _d = acquire()
@@ -124,7 +159,7 @@ type TypeGenerationContext internal (parentCache : TypeCache option) =
         if stack.Count > 0 then [||] else
 
         dict 
-        |> Seq.map (function KeyValue(_,v) -> v.Cell.Type, v.Cell.Value, Seq.toArray v.Dependencies) 
+        |> Seq.map (function KeyValue(_,v) -> v.Cell.Type, v.Cell.Key, v.Cell.Value, Seq.toArray v.Dependencies) 
         |> Seq.toArray
 
     interface IDisposable with
@@ -134,7 +169,7 @@ type TypeGenerationContext internal (parentCache : TypeCache option) =
             | None -> ()
 
 /// Thread-safe cache of values indexed by type.
-and TypeCache private (cache : ConcurrentDictionary<Type, CachePayload>) =
+and TypeCache private (cache : ConcurrentDictionary<option<obj>*Type, CachePayload>) =
     let generators = new ConcurrentDictionary<string, unit>()
 
     let lockObj = new obj()
@@ -145,7 +180,7 @@ and TypeCache private (cache : ConcurrentDictionary<Type, CachePayload>) =
 
     let awaitUnlock() = lock lockObj id
 
-    let clone (cache : ConcurrentDictionary<Type, CachePayload>) =
+    let clone (cache : ConcurrentDictionary<option<obj>*Type, CachePayload>) =
         cache
         |> Seq.map (fun kv ->
             let payload = kv.Value
@@ -153,7 +188,7 @@ and TypeCache private (cache : ConcurrentDictionary<Type, CachePayload>) =
             KeyValuePair(kv.Key, payload2))
         |> ConcurrentDictionary
 
-    let rec cleanup (ts : Type list) =
+    let rec cleanup (ts : (option<obj>*Type) list) =
         match ts with
         | [] -> ()
         | t :: rest ->
@@ -169,9 +204,11 @@ and TypeCache private (cache : ConcurrentDictionary<Type, CachePayload>) =
     /// Total number of items in cache
     member __.Count = cache.Count
     /// Checks whether the supplied type is contained in cache
-    member __.ContainsKey<'T>() = cache.ContainsKey typeof<'T>
+    member __.ContainsKey<'T>() = cache.ContainsKey (None, typeof<'T>)
+    member __.ContainsKeyKey<'T> (key:option<obj>) = cache.ContainsKey (key, typeof<'T>)
     /// Checks whether the supplied type is contained in cache
-    member __.ContainsKey(t : Type) = cache.ContainsKey t
+    member __.ContainsKey(t : Type) = cache.ContainsKey (None, t)
+    member __.ContainsKeyKey(key:option<obj>, t : Type) = cache.ContainsKey (key, t)
     /// Gets all types registered in the cache
     member __.Keys = cache.Keys |> Seq.map id
     /// Gets all values registered in the cache
@@ -180,44 +217,84 @@ and TypeCache private (cache : ConcurrentDictionary<Type, CachePayload>) =
     /// Try looking up cached value by type
     member __.TryGetValue<'T>(result : byref<'T>) : bool =
         let mutable p = Unchecked.defaultof<_>
-        if cache.TryGetValue(typeof<'T>, &p) then
+        if cache.TryGetValue((None, typeof<'T>), &p) then
             result <- p.Value :?> 'T ; true
         else
             false
 
+    member __.TryGetValueKey<'T> (key:option<obj>, result : byref<'T>) : bool =
+        let mutable p = Unchecked.defaultof<_>
+        if cache.TryGetValue((key, typeof<'T>), &p) then
+            result <- p.Value :?> 'T ; true
+        else
+            false
+
+
     /// Try looking up cached value by type
     member __.TryGetValue(t : Type, result : byref<obj>) : bool =
         let mutable p = Unchecked.defaultof<_>
-        if cache.TryGetValue(t, &p) then
+        if cache.TryGetValue((None, t), &p) then
             result <- p.Value ; true
         else
             false
 
+    member __.TryGetValueKey(key: option<obj>, t : Type, result : byref<obj>) : bool =
+        let mutable p = Unchecked.defaultof<_>
+        if cache.TryGetValue((key, t), &p) then
+            result <- p.Value ; true
+        else
+            false
+
+
     /// Try looking up cached value by type
     member __.TryFind<'T>() : 'T option =
         let mutable p = Unchecked.defaultof<_>
-        if cache.TryGetValue(typeof<'T>, &p) then Some(p.Value :?> 'T)
+        if cache.TryGetValue((None, typeof<'T>), &p) then Some(p.Value :?> 'T)
         else None
+
+    member __.TryFindKey<'T> (key:option<obj>) : 'T option =
+        let mutable p = Unchecked.defaultof<_>
+        if cache.TryGetValue((key, typeof<'T>), &p) then Some(p.Value :?> 'T)
+        else None
+
 
     /// Try looking up cached value by type
     member __.TryFind(t : Type) : obj option =
         let mutable p = Unchecked.defaultof<_>
-        if cache.TryGetValue(t, &p) then Some p.Value
+        if cache.TryGetValue((None, t), &p) then Some p.Value
         else None
+
+    member __.TryFindKey(key:option<obj>, t : Type) : obj option =
+        let mutable p = Unchecked.defaultof<_>
+        if cache.TryGetValue((key, t), &p) then Some p.Value
+        else None
+
 
     /// Removes given type and any dependencies from cache
     /// This will clean up any dependencies on that type too.
     member __.Remove(t : Type) =
-        fun () -> cleanup [t]
+        fun () -> cleanup [(None, t)]
         |> withLockedCache
+
+    member __.RemoveKey(key:option<obj>, t : Type) =
+        fun () -> cleanup [(key, t)]
+        |> withLockedCache
+
 
     /// Forces update for value of given type
     /// This will clean up any dependencies on that type too.
     member __.ForceAdd<'T>(value : 'T) =
         fun () ->
-            cleanup [typeof<'T>]
-            cache.[typeof<'T>] <- { Type = typeof<'T> ; Value = value ; Dependencies = HashSet() }
+            cleanup [(None, typeof<'T>)]
+            cache.[(None, typeof<'T>)] <- { Type = typeof<'T> ; Key = None; Value = value ; Dependencies = HashSet() }
         |> withLockedCache
+
+    member __.ForceAddKey<'T>(key:option<obj>, value : 'T) =
+        fun () ->
+            cleanup [(key, typeof<'T>)]
+            cache.[(key, typeof<'T>)] <- { Type = typeof<'T> ; Key = key; Value = value ; Dependencies = HashSet() }
+        |> withLockedCache
+
 
     /// Creates a TypeGenerationContext that is bound to the current cache.
     /// Values generated by the manager can be committed back to the
@@ -235,14 +312,14 @@ and TypeCache private (cache : ConcurrentDictionary<Type, CachePayload>) =
 
         let values = ctx.GetGeneratedValues()
 
-        for t,v,_ in values do
-            let _ = cache.GetOrAdd(t, fun t -> { Type = t ; Value = v ; Dependencies = HashSet() })
+        for t,k,v,_ in values do
+            let _ = cache.GetOrAdd((k,t), fun (k,t) -> { Type = t ; Key = k; Value = v ; Dependencies = HashSet() })
             ()
 
-        for t,_,deps in values do
+        for t,k,_,deps in values do
             for d in deps do
                 let p = cache.[d]
-                let _ = lock p.Dependencies (fun () -> p.Dependencies.Add t)
+                let _ = lock p.Dependencies (fun () -> p.Dependencies.Add (k, t))
                 ()
                         
         let _ = generators.TryRemove(ctx.Id)
